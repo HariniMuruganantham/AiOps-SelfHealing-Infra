@@ -1,0 +1,143 @@
+services:
+
+  localstack:
+    image: localstack/localstack-pro:latest
+    container_name: p2-localstack
+    ports:
+      - "4567:4566"
+    environment:
+      - SERVICES=ec2,logs,cloudwatch,sns,iam
+      - DEBUG=0
+      - LOCALSTACK_HOST=localstack
+      - AWS_DEFAULT_REGION=us-east-1
+      - LOCALSTACK_AUTH_TOKEN=${LOCALSTACK_AUTH_TOKEN}
+    volumes:
+      - ./scripts/init-aws.sh:/etc/localstack/init/ready.d/init-aws.sh:ro
+      - localstack-data:/var/lib/localstack
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - p2-net
+
+  auth-svc:
+    build:
+      context: ./services/auth
+      dockerfile: Dockerfile
+    container_name: p2-auth
+    environment:
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - PORT=5001
+    ports:
+      - "5011:5001"
+    depends_on:
+      localstack:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - p2-net
+
+  payment-svc:
+    build:
+      context: ./services/payment
+      dockerfile: Dockerfile
+    container_name: p2-payment
+    environment:
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - PORT=5002
+    ports:
+      - "5012:5002"
+    depends_on:
+      localstack:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5002/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - p2-net
+
+  inventory-svc:
+    build:
+      context: ./services/inventory
+      dockerfile: Dockerfile
+    container_name: p2-inventory
+    environment:
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - PORT=5003
+    ports:
+      - "5013:5003"
+    depends_on:
+      localstack:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5003/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - p2-net
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: p2-backend
+    environment:
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - AUTH_URL=http://auth-svc:5001
+      - PAYMENT_URL=http://payment-svc:5002
+      - INVENTORY_URL=http://inventory-svc:5003
+    ports:
+      - "8002:8000"
+    depends_on:
+      localstack:
+        condition: service_healthy
+      auth-svc:
+        condition: service_healthy
+      payment-svc:
+        condition: service_healthy
+      inventory-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - p2-net
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: p2-frontend
+    ports:
+      - "3002:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - p2-net
+
+volumes:
+  localstack-data:
+
+networks:
+  p2-net:
+    driver: bridge
