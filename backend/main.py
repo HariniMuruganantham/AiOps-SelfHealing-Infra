@@ -1,22 +1,24 @@
 """
 Project 2 Backend — Self-Healing Infrastructure (Real Infrastructure)
 - Monitors REAL Flask services via HTTP health checks
-- Detects anomalies using numpy LSTM-style detector
-- Heals via LocalStack EC2 API (reboot/stop/start instances)
-- Streams live via WebSocket
+- Detects anomalies using numpy weighted sliding-window detector
+- Heals via LocalStack EC2 API (reboot/circuit-break/scale-out)
+- Streams live metrics + heal events via WebSocket
+- Exposes /metrics/history for chart replay and /status for overview
 """
 import os, time, asyncio, json
 import httpx
 import boto3
 import numpy as np
 from collections import deque
+from datetime import datetime, timezone
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="Self-Healing Infrastructure — Real Infra", version="2.0.0")
+app = FastAPI(title="Self-Healing Infrastructure — Real Infra", version="2.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 
@@ -45,6 +47,13 @@ AWS_KWARGS   = dict(
 ec2 = boto3.client("ec2", **AWS_KWARGS)
 
 
+# ── Metric history store ───────────────────────────────────────────────────
+MAX_HISTORY  = 120
+metric_history: deque = deque(maxlen=MAX_HISTORY)
+heal_history:   list  = []
+MAX_HEAL_LOG  = 50
+
+
 # ── Real metric collector ──────────────────────────────────────────────────
 async def collect_real_metrics() -> dict:
     """Poll all real services for their actual metrics."""
@@ -62,7 +71,8 @@ async def collect_real_metrics() -> dict:
                         "memory":        m.get("memory_percent", 0) / 100,
                         "error_rate":    m.get("error_rate", 0),
                         "response_time": m.get("latency_ms", 0),
-                        "status":        m.get("status", "healthy")
+                        "status":        m.get("status", "healthy"),
+                        "timestamp":     datetime.now(timezone.utc).isoformat()
                     }
                 else:
                     raise Exception(f"HTTP {r.status_code}")
@@ -74,14 +84,15 @@ async def collect_real_metrics() -> dict:
                     "memory":        0.0,
                     "error_rate":    1.0,
                     "response_time": 9999.0,
-                    "status":        "down"
+                    "status":        "down",
+                    "timestamp":     datetime.now(timezone.utc).isoformat()
                 }
     return snapshot
 
 
-# ── LSTM-style anomaly detector (numpy, no TensorFlow) ────────────────────
+# ── Weighted sliding-window anomaly detector ───────────────────────────────
 SEQ_LEN    = 15
-N_FEATURES = 4
+N_FEATURES = 5   # added health as explicit feature
 
 
 class AnomalyDetector:
@@ -97,10 +108,11 @@ class AnomalyDetector:
     def _features(self, snap: dict) -> np.ndarray:
         svcs = list(snap.values())
         return np.array([
-            np.mean([s["cpu"]           for s in svcs]),
-            np.mean([s["memory"]        for s in svcs]),
-            np.mean([s["error_rate"]    for s in svcs]),
-            np.mean([s["response_time"] / 10000 for s in svcs])
+            np.mean([s["cpu"]                    for s in svcs]),
+            np.mean([s["memory"]                 for s in svcs]),
+            np.mean([s["error_rate"]             for s in svcs]),
+            np.mean([s["response_time"] / 10000  for s in svcs]),
+            np.mean([1.0 - s["health"]           for s in svcs]),  # degradation score
         ])
 
     def warmup(self, snapshots: list):
@@ -110,25 +122,43 @@ class AnomalyDetector:
         self.trained       = True
         print(f"Detector trained on {len(snapshots)} real metric snapshots.")
 
-    def detect(self, snap: dict) -> tuple:
+    def detect(self, snap: dict) -> tuple[bool, float, dict]:
+        """Returns (is_anomaly, score, per_feature_scores)."""
         self.history.append(self._features(snap))
         if not self.trained or len(self.history) < SEQ_LEN:
-            return False, 0.0
+            return False, 0.0, {}
+
         seq      = np.array(list(self.history)[-SEQ_LEN:])
         seq_norm = (seq - self.baseline_mean) / self.baseline_std
         per_step = np.mean(seq_norm ** 2, axis=1)
         error    = float(np.dot(self.weights, per_step))
-        return error > self.threshold, round(error, 6)
+
+        # Per-feature contribution for UI
+        last_norm      = seq_norm[-1]
+        feature_scores = {
+            "cpu":           round(float(last_norm[0] ** 2), 4),
+            "memory":        round(float(last_norm[1] ** 2), 4),
+            "error_rate":    round(float(last_norm[2] ** 2), 4),
+            "response_time": round(float(last_norm[3] ** 2), 4),
+            "degradation":   round(float(last_norm[4] ** 2), 4),
+        }
+        return error > self.threshold, round(error, 6), feature_scores
 
 
-# ── EC2 remediation via LocalStack ────────────────────────────────────────
+# ── EC2 remediation via LocalStack ─────────────────────────────────────────
 class EC2Remediator:
     def __init__(self):
         self.active       = {}
         self.instance_map = {}
+        self.cooldown     = {}   # per-service cooldown timestamps
+        self.COOLDOWN_SEC = 90
 
     def register_instance(self, service: str, instance_id: str):
         self.instance_map[service] = instance_id
+
+    def in_cooldown(self, name: str) -> bool:
+        last = self.cooldown.get(name, 0)
+        return time.time() - last < self.COOLDOWN_SEC
 
     def decide_action(self, name: str, metrics: dict) -> str:
         if metrics["error_rate"] > 0.5:  return "circuit_break"
@@ -137,15 +167,32 @@ class EC2Remediator:
         return "none"
 
     async def heal(self, service: str, action: str, metrics: dict):
-        if service in self.active:
+        if service in self.active or self.in_cooldown(service):
             return None
 
-        self.active[service] = action
-        print(f"[HEAL] {action} on {service}")
+        self.active[service]   = action
+        self.cooldown[service] = time.time()
+        ts = datetime.now(timezone.utc).isoformat()
+        print(f"[HEAL] {action} on {service} at {ts}")
+
+        result = {
+            "service":   service,
+            "action":    action,
+            "result":    "recovered",
+            "ec2_call":  False,
+            "instance":  self.instance_map.get(service, ""),
+            "timestamp": ts,
+            "metrics_at_heal": {
+                "error_rate":    metrics["error_rate"],
+                "response_time": metrics["response_time"],
+                "cpu":           round(metrics["cpu"] * 100, 1)
+            }
+        }
 
         try:
             if action == "reboot_instance" and service in self.instance_map:
                 ec2.reboot_instances(InstanceIds=[self.instance_map[service]])
+                result["ec2_call"] = True
                 print(f"[EC2] Rebooted instance {self.instance_map[service]}")
                 await asyncio.sleep(4)
 
@@ -158,6 +205,7 @@ class EC2Remediator:
                     url = SERVICES.get(service, "")
                     if url:
                         await client.post(f"{url}/recover")
+                result["ec2_call"] = False
                 print(f"[EC2] Circuit break + recover for {service}")
                 await asyncio.sleep(2)
 
@@ -165,22 +213,18 @@ class EC2Remediator:
                 await asyncio.sleep(3)
 
         except Exception as e:
+            result["result"] = f"error: {str(e)}"
             print(f"[HEAL ERROR] {service}: {e}")
 
         self.active.pop(service, None)
-        return {
-            "service":  service,
-            "action":   action,
-            "result":   "recovered",
-            "ec2_call": action == "reboot_instance",
-            "instance": self.instance_map.get(service, ""),
-            "timestamp": time.time()
-        }
+        return result
 
     async def auto_remediate(self, snapshot: dict) -> list:
         tasks = []
         for name, metrics in snapshot.items():
-            if metrics["status"] in ("degraded", "down") and name not in self.active:
+            if (metrics["status"] in ("degraded", "down")
+                    and name not in self.active
+                    and not self.in_cooldown(name)):
                 action = self.decide_action(name, metrics)
                 if action != "none":
                     tasks.append(self.heal(name, action, metrics))
@@ -200,12 +244,12 @@ WARMUP_TICKS     = 20
 
 @app.on_event("startup")
 async def startup():
-    print("Self-Healing backend starting...")
-    print(f"Monitoring services: {list(SERVICES.keys())}")
-    print(f"Will warmup detector after {WARMUP_TICKS} real metric snapshots.")
+    print("Self-Healing backend starting (v2.1.0)...")
+    print(f"Monitoring: {list(SERVICES.keys())}")
     try:
         resp = ec2.describe_instances(
-            Filters=[{"Name": "tag:Name", "Values": ["auth-svc", "payment-svc", "inventory-svc"]}]
+            Filters=[{"Name": "tag:Name",
+                      "Values": ["auth-svc", "payment-svc", "inventory-svc"]}]
         )
         for res in resp["Reservations"]:
             for inst in res["Instances"]:
@@ -225,9 +269,44 @@ async def startup():
 @app.get("/health")
 def health():
     return {
-        "status":    "ok",
-        "mode":      "real-infrastructure",
-        "localstack": AWS_ENDPOINT
+        "status":     "ok",
+        "version":    "2.1.0",
+        "mode":       "real-infrastructure",
+        "localstack": AWS_ENDPOINT,
+        "trained":    detector.trained,
+        "registered": list(remediator.instance_map.keys())
+    }
+
+
+@app.get("/status")
+async def status():
+    """Full system snapshot — services, detector state, heal history."""
+    snapshot = await collect_real_metrics()
+    return {
+        "services":      snapshot,
+        "detector": {
+            "trained":   detector.trained,
+            "threshold": detector.threshold,
+            "history_len": len(detector.history)
+        },
+        "remediator": {
+            "active":    list(remediator.active.keys()),
+            "cooldowns": {k: round(remediator.COOLDOWN_SEC - (time.time() - v), 1)
+                          for k, v in remediator.cooldown.items()
+                          if time.time() - v < remediator.COOLDOWN_SEC},
+            "registered": list(remediator.instance_map.keys())
+        },
+        "heal_history":  heal_history[-10:],
+        "tick":          tick_count
+    }
+
+
+@app.get("/metrics/history")
+def metrics_history():
+    """Last 120 ticks of metric snapshots for chart replay."""
+    return {
+        "ticks": list(metric_history),
+        "count": len(metric_history)
     }
 
 
@@ -250,7 +329,6 @@ async def get_services():
 
 @app.post("/demo/crash/{service}")
 async def demo_crash(service: str, duration: int = 60):
-    """Inject a real failure for the live demo."""
     url = SERVICES.get(service)
     if not url:
         return {"error": f"Unknown service: {service}"}
@@ -261,7 +339,6 @@ async def demo_crash(service: str, duration: int = 60):
 
 @app.post("/demo/recover/{service}")
 async def demo_recover(service: str):
-    """Recover a service manually."""
     url = SERVICES.get(service)
     if not url:
         return {"error": f"Unknown service: {service}"}
@@ -274,11 +351,11 @@ async def demo_recover(service: str):
 
 @app.get("/aws/infra")
 def aws_infra():
-    """Full AWS infrastructure overview — EC2 + SNS + CloudWatch Alarms."""
+    """Full AWS infrastructure overview."""
     try:
-        # EC2 instances
         ec2_resp  = ec2.describe_instances(
-            Filters=[{"Name": "tag:Name", "Values": ["auth-svc", "payment-svc", "inventory-svc"]}]
+            Filters=[{"Name": "tag:Name",
+                      "Values": ["auth-svc", "payment-svc", "inventory-svc"]}]
         )
         instances = []
         for r in ec2_resp["Reservations"]:
@@ -299,15 +376,12 @@ def aws_infra():
                     "healing_now":  name in remediator.active
                 })
 
-        # SNS topics
         sns    = boto3.client("sns", **AWS_KWARGS)
         topics = sns.list_topics().get("Topics", [])
 
-        # CloudWatch alarms
         cw     = boto3.client("cloudwatch", **AWS_KWARGS)
         alarms = cw.describe_alarms().get("MetricAlarms", [])
 
-        # Key pair
         keys = ec2.describe_key_pairs().get("KeyPairs", [])
 
         return {
@@ -333,8 +407,8 @@ def aws_infra():
                 }
                 for a in alarms
             ],
-            "key_pairs": [k["KeyName"] for k in keys],
-            "healing_active": list(remediator.active.keys()),
+            "key_pairs":            [k["KeyName"] for k in keys],
+            "healing_active":       list(remediator.active.keys()),
             "registered_instances": remediator.instance_map
         }
     except Exception as e:
@@ -343,10 +417,10 @@ def aws_infra():
 
 @app.get("/aws/ec2")
 def aws_ec2():
-    """EC2 instances — mirrors AWS Console EC2 dashboard."""
     try:
         resp      = ec2.describe_instances(
-            Filters=[{"Name": "tag:Name", "Values": ["auth-svc", "payment-svc", "inventory-svc"]}]
+            Filters=[{"Name": "tag:Name",
+                      "Values": ["auth-svc", "payment-svc", "inventory-svc"]}]
         )
         instances = []
         for r in resp["Reservations"]:
@@ -384,37 +458,59 @@ async def metrics_ws(ws: WebSocket):
             tick_count += 1
             snapshot    = await collect_real_metrics()
 
+            # Store in history for replay
+            metric_history.append({
+                "tick":      tick_count,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "services":  snapshot
+            })
+
             if not detector.trained:
                 warmup_snapshots.append(snapshot)
                 if len(warmup_snapshots) >= WARMUP_TICKS:
                     detector.warmup(warmup_snapshots)
                 await ws.send_json({
-                    "tick":           tick_count,
-                    "services":       snapshot,
-                    "is_anomaly":     False,
-                    "lstm_error":     0.0,
-                    "remediations":   [],
-                    "healing_active": [],
-                    "status":         f"warming_up ({len(warmup_snapshots)}/{WARMUP_TICKS})"
+                    "tick":             tick_count,
+                    "services":         snapshot,
+                    "is_anomaly":       False,
+                    "lstm_error":       0.0,
+                    "anomaly_threshold": detector.threshold,
+                    "feature_scores":   {},
+                    "remediations":     [],
+                    "healing_active":   [],
+                    "cooldowns":        {},
+                    "status":           f"warming_up ({len(warmup_snapshots)}/{WARMUP_TICKS})"
                 })
                 await asyncio.sleep(1)
                 continue
 
-            is_anomaly, error = detector.detect(snapshot)
+            is_anomaly, error, feature_scores = detector.detect(snapshot)
 
             remediations = []
             if is_anomaly:
                 remediations = await remediator.auto_remediate(snapshot)
+                for r in remediations:
+                    heal_history.append(r)
+                if len(heal_history) > MAX_HEAL_LOG:
+                    heal_history[:] = heal_history[-MAX_HEAL_LOG:]
+
+            cooldowns = {
+                k: round(remediator.COOLDOWN_SEC - (time.time() - v), 1)
+                for k, v in remediator.cooldown.items()
+                if time.time() - v < remediator.COOLDOWN_SEC
+            }
 
             await ws.send_json({
-                "tick":             tick_count,
-                "services":         snapshot,
-                "is_anomaly":       is_anomaly,
-                "lstm_error":       error,
+                "tick":              tick_count,
+                "services":          snapshot,
+                "is_anomaly":        is_anomaly,
+                "lstm_error":        error,
                 "anomaly_threshold": detector.threshold,
-                "remediations":     remediations,
-                "healing_active":   list(remediator.active.keys()),
-                "status":           "live"
+                "feature_scores":    feature_scores,
+                "remediations":      remediations,
+                "healing_active":    list(remediator.active.keys()),
+                "cooldowns":         cooldowns,
+                "status":            "live"
             })
             await asyncio.sleep(1)
 
