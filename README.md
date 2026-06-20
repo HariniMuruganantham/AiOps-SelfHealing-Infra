@@ -47,12 +47,7 @@ All service health, anomaly scores, and remediation events stream to the React d
 
 ## 🏗 Architecture
 
-| Layer | Role |
-|---|---|
-| **Microservices** | 3 Flask services expose `/metrics` (real psutil CPU/memory), `/crash`, and `/recover` endpoints |
-| **Backend** | FastAPI polls all services every second, runs weighted sliding-window anomaly detection, triggers EC2-level remediation on anomaly |
-| **LocalStack** | Emulates EC2 (reboot/stop/start), CloudWatch alarms, and SNS alerts locally |
-| **Frontend** | React dashboard streams live metrics, LSTM score chart, feature breakdown, and remediation log over WebSocket |
+![AIOps Architecture](./image.png)
 
 ---
 
