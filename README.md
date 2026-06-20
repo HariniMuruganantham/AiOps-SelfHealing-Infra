@@ -1,4 +1,4 @@
-# 🔧 AiOps Self-Healing Infrastructure
+# HealGrid
 
 <div align="center">
 
@@ -9,6 +9,7 @@
 ![LocalStack](https://img.shields.io/badge/LocalStack-Pro-FF9900?style=for-the-badge&logo=amazonaws&logoColor=white)
 ![NumPy](https://img.shields.io/badge/NumPy-Anomaly_Detection-013243?style=for-the-badge&logo=numpy&logoColor=white)
 ![WebSocket](https://img.shields.io/badge/WebSocket-Live_Streaming-010101?style=for-the-badge)
+![GitHub Actions](https://img.shields.io/badge/CI%2FCD-GitHub%20Actions-black?style=for-the-badge&logo=githubactions)
 ![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
 
 **A production-grade AIOps portfolio project where infrastructure heals itself. Anomalies are detected in real-time via a weighted sliding-window model, triggering EC2 API calls through LocalStack to reboot, circuit-break, or scale out affected services automatically.**
@@ -37,7 +38,7 @@
 
 ## 🧠 Overview
 
-**AiOps Self-Healing Infrastructure** monitors three real Flask microservices, detects anomalies using a weighted sliding-window model over live CPU, memory, latency, error rate, and health metrics, and automatically triggers remediation actions via LocalStack EC2 and service-level recovery endpoints.
+**HealGrid** monitors three real Flask microservices, detects anomalies using a weighted sliding-window model over live CPU, memory, latency, error rate, and health metrics, and automatically triggers remediation actions via LocalStack EC2 and service-level recovery endpoints.
 
 All service health, anomaly scores, and remediation events stream to the React dashboard in real-time over WebSocket — no polling, no page refresh.
 
@@ -47,7 +48,7 @@ All service health, anomaly scores, and remediation events stream to the React d
 
 ## 🏗 Architecture
 
-![AIOps Architecture](./image.png)
+![HealGrid Architecture](./image.png)
 
 ---
 
@@ -62,6 +63,7 @@ All service health, anomaly scores, and remediation events stream to the React d
 | **Cloud Emulation** | LocalStack Pro (EC2, CloudWatch, SNS) |
 | **Streaming** | WebSocket — live metrics pushed every second |
 | **Containerisation** | Docker, Docker Compose |
+| **CI/CD** | GitHub Actions |
 
 ---
 
@@ -93,7 +95,7 @@ The backend collects a 5-feature vector from all services every second:
 
 Over 20 warm-up ticks it builds a baseline mean and standard deviation. Each subsequent tick gets z-score normalised against that baseline, passed through a 15-tick exponentially weighted window, and scored. Any score above the threshold (0.06) triggers anomaly detection.
 
-### Remediation decision
+### Remediation Decision
 
 | Condition | Action |
 |---|---|
@@ -108,7 +110,7 @@ Each service has a 90-second cooldown after a heal to prevent repeated triggers.
 ## 📁 Project Structure
 
 ```
-AiOps-Self-Healing-Infra/
+HealGrid/
 ├── backend/
 │   ├── main.py               # FastAPI · AnomalyDetector · EC2Remediator · WebSocket stream
 │   ├── requirements.txt
@@ -188,7 +190,7 @@ docker compose up --build
 
 1. Open the dashboard at http://localhost:3002
 2. Wait 20 seconds for the detector to warm up
-3. Click "Crash auth" — watch the anomaly score spike
+3. Click **"Crash auth"** — watch the anomaly score spike
 4. Watch the remediation log — circuit break or reboot fires automatically
 5. Service recovers; score returns to baseline
 
@@ -227,7 +229,7 @@ docker compose down -v
 
 ## ☁️ LocalStack Integration
 
-The project uses LocalStack Pro to emulate AWS EC2, CloudWatch, and SNS locally. The `scripts/init-aws.sh` bootstrap script runs on container startup and:
+HealGrid uses LocalStack Pro to emulate AWS EC2, CloudWatch, and SNS locally. The `scripts/init-aws.sh` bootstrap script runs on container startup and:
 
 - Creates a key pair (`aiops-key`)
 - Launches 3 EC2 instances tagged by service name — registered by the backend at startup for EC2 API calls
@@ -245,6 +247,7 @@ Junior DevOps Engineer · AIOps Enthusiast
 
 [![Portfolio](https://img.shields.io/badge/Portfolio-harini--devops-blue?style=flat-square&logo=vercel)](https://harini-devops-portfolio.vercel.app)
 [![GitHub](https://img.shields.io/badge/GitHub-HariniMuruganantham-181717?style=flat-square&logo=github)](https://github.com/HariniMuruganantham)
+[![Substack](https://img.shields.io/badge/Substack-harini--devops-FF6719?style=flat-square&logo=substack)](https://harini-devops.substack.com)
 
 ---
 
